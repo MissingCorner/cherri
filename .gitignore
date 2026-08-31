@@ -1,0 +1,32 @@
+# Build products (app, driver, pkg, iconset all land here)
+build/
+
+# macOS noise
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Xcode / Swift tooling (if ever opened in Xcode)
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+.swiftpm/
+*.playground
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Certificates / signing material (never commit keys)
+*.p12
+*.pem
+*.cer
+*.provisionprofile
+
+# Packaging leftovers
+*.pkg
+*.dmg
+*.iconset/
