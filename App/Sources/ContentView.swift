@@ -32,8 +32,8 @@ struct ContentView: View {
                 centerSection
                 Spacer(minLength: 0)
                 if state.captionsEnabled {
-                    CaptionsStrip()
-                        .frame(height: 200)
+                    CaptionsStrip(store: state.captionStore)
+                        .frame(height: 235)
                 }
             }
             if let error = state.lastError {
@@ -93,13 +93,12 @@ struct ContentView: View {
                     title: state.liveMode ? "Their Language" : "Meeting Language",
                     selection: $state.meetingLanguageCode,
                     edge: .trailing)
-                Orb(
+                OrbLive(
+                    levels: state.levels,
                     isRunning: state.isRunning,
                     isStarting: state.isStarting,
-                    micLevel: normalized(state.micLevelDb),
-                    meetingLevel: normalized(state.meetingLevelDb),
-                    micActive: state.micStreaming && !state.micMuted,
-                    meetingActive: state.meetingStreaming && !state.inboundPaused
+                    micMuted: state.micMuted,
+                    inboundPaused: state.inboundPaused
                 ) {
                     state.toggle()
                 }
@@ -204,10 +203,6 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: edge)
     }
 
-    private func normalized(_ db: Float) -> Double {
-        Double(min(max((db + 55) / 45, 0), 1))
-    }
-
     private var statusTitle: String {
         if state.isStarting { return "Starting…" }
         if state.isRunning { return "Interpreting" }
@@ -224,6 +219,32 @@ struct ContentView: View {
 }
 
 // MARK: - Orb + visualizer
+
+/// Thin wrapper observing the high-frequency level store, so level ticks
+/// re-render only the orb — not the whole window.
+private struct OrbLive: View {
+    @ObservedObject var levels: LevelStore
+    let isRunning: Bool
+    let isStarting: Bool
+    let micMuted: Bool
+    let inboundPaused: Bool
+    let action: () -> Void
+
+    private func normalized(_ db: Float) -> Double {
+        Double(min(max((db + 55) / 45, 0), 1))
+    }
+
+    var body: some View {
+        Orb(
+            isRunning: isRunning,
+            isStarting: isStarting,
+            micLevel: normalized(levels.micDb),
+            meetingLevel: normalized(levels.meetingDb),
+            micActive: levels.micStreaming && !micMuted,
+            meetingActive: levels.meetingStreaming && !inboundPaused,
+            action: action)
+    }
+}
 
 /// The heart of the app: a large circular start/stop control surrounded by
 /// pulse rings and, while running, a radial audio visualizer — left arc
@@ -258,7 +279,7 @@ private struct Orb: View {
     private let orbRadius: CGFloat = 74
 
     var body: some View {
-        TimelineView(.animation) { timeline in
+        TimelineView(.animation(minimumInterval: isRunning ? 1.0 / 30.0 : 1.0 / 10.0)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             ZStack {
                 pulseRings(t)
@@ -367,23 +388,96 @@ private struct Orb: View {
 
 private struct CaptionsStrip: View {
     @EnvironmentObject var state: AppState
+    @ObservedObject var store: CaptionStore
 
     var body: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 0) {
-                CaptionFeed(
-                    title: "Them → \(AppState.languageName(for: state.userLanguageCode))",
-                    accent: .blue,
-                    captions: state.captions.filter { $0.speaker == .them })
-                Divider()
-                CaptionFeed(
-                    title: "You → \(AppState.languageName(for: state.meetingLanguageCode))",
-                    accent: .green,
-                    captions: state.captions.filter { $0.speaker == .you })
+            if state.liveMode {
+                // One room, one interpreter: a single chronological feed.
+                LiveCaptionFeed(
+                    myLanguage: AppState.languageName(for: state.userLanguageCode),
+                    theirLanguage: AppState.languageName(for: state.meetingLanguageCode),
+                    captions: store.captions)
+            } else {
+                HStack(spacing: 0) {
+                    CaptionFeed(
+                        title: "Them → \(AppState.languageName(for: state.userLanguageCode))",
+                        accent: .blue,
+                        captions: store.captions.filter { $0.speaker == .them })
+                    Divider()
+                    CaptionFeed(
+                        title: "You → \(AppState.languageName(for: state.meetingLanguageCode))",
+                        accent: .green,
+                        captions: store.captions.filter { $0.speaker == .you })
+                }
             }
         }
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.6))
+    }
+}
+
+/// Live mode: every translated utterance in one stream, a colored dot marking
+/// the direction (blue = into my language, green = into theirs).
+private struct LiveCaptionFeed: View {
+    let myLanguage: String
+    let theirLanguage: String
+    let captions: [Caption]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Text("Interpreter")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+                HStack(spacing: 4) {
+                    Circle().fill(Color.blue).frame(width: 6, height: 6)
+                    Text("→ \(myLanguage)")
+                    Circle().fill(Color.green).frame(width: 6, height: 6)
+                        .padding(.leading, 6)
+                    Text("→ \(theirLanguage)")
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(captions) { caption in
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Circle()
+                                    .fill(caption.speaker == .them ? Color.blue : Color.green)
+                                    .frame(width: 7, height: 7)
+                                Text(caption.text)
+                                    .font(.system(.title3, design: .rounded))
+                                    .lineSpacing(3)
+                                    .opacity(caption.isFinal ? 1.0 : 0.65)
+                                    .contentTransition(.opacity)
+                                    .animation(.easeOut(duration: 0.25), value: caption.text)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .id(caption.id)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.3), value: captions.count)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 12)
+                }
+                .onChange(of: captions.last?.text) { _, _ in
+                    if let last = captions.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -407,18 +501,23 @@ private struct CaptionFeed: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 6) {
+                    LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(captions) { caption in
                             Text(caption.text)
-                                .font(.callout)
-                                .opacity(caption.isFinal ? 1.0 : 0.6)
+                                .font(.system(.title3, design: .rounded))
+                                .lineSpacing(3)
+                                .opacity(caption.isFinal ? 1.0 : 0.65)
+                                .contentTransition(.opacity)
+                                .animation(.easeOut(duration: 0.25), value: caption.text)
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .id(caption.id)
+                                .transition(.opacity.combined(with: .move(edge: .bottom)))
                         }
                     }
+                    .animation(.easeOut(duration: 0.3), value: captions.count)
                     .padding(.horizontal, 14)
-                    .padding(.bottom, 10)
+                    .padding(.bottom, 12)
                 }
                 .onChange(of: captions.last?.text) { _, _ in
                     if let last = captions.last {

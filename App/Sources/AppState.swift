@@ -76,11 +76,10 @@ final class AppState: ObservableObject {
     @Published var voiceTestPhase: String?
     /// Non-error notice shown as an orange toast (e.g. idle auto-stop).
     @Published var notice: String?
-    // Live telemetry from the pipeline (~20 Hz while running).
-    @Published var micLevelDb: Float = -80
-    @Published var micStreaming = false
-    @Published var meetingLevelDb: Float = -80
-    @Published var meetingStreaming = false
+    // High-frequency streams live in dedicated stores so their updates only
+    // re-render the views that draw them (see Stores.swift).
+    let levels = LevelStore()
+    let captionStore = CaptionStore()
     /// True when the session has been running a while but the meeting side
     /// is dead silent — almost always the meeting app's speaker not routed
     /// to "Interpreter Line Output".
@@ -138,7 +137,6 @@ final class AppState: ObservableObject {
         didSet { pipeline.setInboundPaused(inboundPaused) }
     }
     @Published var statusLines: [String] = []
-    @Published var captions: [Caption] = []
     @Published var driverInstalled = false
     @Published var lastError: String?
 
@@ -243,10 +241,10 @@ final class AppState: ObservableObject {
         pipeline.onLevels = { [weak self] micDb, micOn, meetingDb, meetingOn in
             Task { @MainActor in
                 guard let self else { return }
-                self.micLevelDb = micDb
-                self.micStreaming = micOn
-                self.meetingLevelDb = meetingDb
-                self.meetingStreaming = meetingOn
+                self.levels.micDb = micDb
+                self.levels.micStreaming = micOn
+                self.levels.meetingDb = meetingDb
+                self.levels.meetingStreaming = meetingOn
                 self.evaluateMeetingAudio(meetingDb: self.liveMode ? micDb : meetingDb)
             }
         }
@@ -345,7 +343,7 @@ final class AppState: ObservableObject {
         saveAPIKey()
         micMuted = false
         inboundPaused = false
-        captions.removeAll()
+        captionStore.captions.removeAll()
         liveCaptionIndex.removeAll()
 
         let config = InterpreterPipeline.Config(
@@ -489,24 +487,41 @@ final class AppState: ObservableObject {
         }
     }
 
+    private static func endsSentence(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespaces).last else { return false }
+        return ".!?…。！？".contains(last)
+    }
+
     private func appendCaption(delta: String, isFinal: Bool, speaker: Caption.Speaker) {
         if isFinal {
-            if let index = liveCaptionIndex[speaker], captions.indices.contains(index) {
-                captions[index].isFinal = true
+            if let index = liveCaptionIndex[speaker], captionStore.captions.indices.contains(index) {
+                captionStore.captions[index].isFinal = true
             }
             liveCaptionIndex[speaker] = nil
             return
         }
         guard !delta.isEmpty else { return }
-        if let index = liveCaptionIndex[speaker], captions.indices.contains(index) {
-            captions[index].text += delta
+        if let index = liveCaptionIndex[speaker], captionStore.captions.indices.contains(index) {
+            captionStore.captions[index].text += delta
+            // One sentence per line: close the row at sentence boundaries so
+            // the next delta starts fresh.
+            if Self.endsSentence(captionStore.captions[index].text) {
+                captionStore.captions[index].isFinal = true
+                liveCaptionIndex[speaker] = nil
+            }
         } else {
-            captions.append(Caption(speaker: speaker, text: delta, isFinal: false))
-            liveCaptionIndex[speaker] = captions.count - 1
+            let trimmed = delta.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return }
+            captionStore.captions.append(Caption(speaker: speaker, text: trimmed, isFinal: false))
+            if Self.endsSentence(trimmed) {
+                captionStore.captions[captionStore.captions.count - 1].isFinal = true
+            } else {
+                liveCaptionIndex[speaker] = captionStore.captions.count - 1
+            }
         }
-        if captions.count > 100 {
-            let removeCount = captions.count - 100
-            captions.removeFirst(removeCount)
+        if captionStore.captions.count > 100 {
+            let removeCount = captionStore.captions.count - 100
+            captionStore.captions.removeFirst(removeCount)
             liveCaptionIndex = liveCaptionIndex.mapValues { $0 - removeCount }
         }
     }

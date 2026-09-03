@@ -231,13 +231,13 @@ final class InterpreterPipeline {
 
     private func emitLevels() {
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastLevelEmit >= 0.05 else { return }
+        guard now - lastLevelEmit >= 0.1 else { return }
         lastLevelEmit = now
         let gateOn = config?.voiceGateEnabled == true
         let micStreaming = !micMuted && (!gateOn || micGate?.isOpen == true)
         if config?.liveMode == true {
-            // No meeting side: the left arc pulses while translation plays.
-            let translating = translatedRing.availableToRead > 0
+            // No meeting side: the left arc pulses while the interpreter speaks.
+            let translating = translatedRing.availableToRead > 0 || outboundRing.availableToRead > 0
             onLevels?(micGate?.levelDb ?? -80, micStreaming,
                       translating ? -15 : -80, translating)
             return
@@ -412,17 +412,18 @@ final class InterpreterPipeline {
                     out.update(repeating: 0, count: frames)
                     return
                 }
-                self.renderSpeakerMix(out, frames: frames)
+                self.renderLiveMix(out, frames: frames)
             }
             api24kToSpeaker = StreamResampler(sourceRate: 24000, targetRate: speaker.sampleRate)
             api24kToSpeakerB = StreamResampler(sourceRate: 24000, targetRate: speaker.sampleRate)
 
-            // Both translated voices go to the speaker (inbound already does
-            // via its default handler; redirect outbound there too).
+            // One interpreter line: each direction lands in its own ring and
+            // an arbiter plays one at a time (inbound handler already fills
+            // translatedRing; outbound goes to outboundRing).
             outbound.onAudio = { [weak self] pcm16 in
                 guard let self, let resampler = self.api24kToSpeakerB else { return }
                 let floats = PCM.pcm16ToFloat(pcm16)
-                self.translatedRing.write(resampler.process(floats))
+                self.outboundRing.write(resampler.process(floats))
             }
 
             let mic = try startMicCapture(config: config)
@@ -565,6 +566,7 @@ final class InterpreterPipeline {
         testRing.reset()
         inboundDown = false
         outboundDown = false
+        liveSource = 0
         onNotice?(nil)
 
         if isRunning {
@@ -588,6 +590,36 @@ final class InterpreterPipeline {
             let plain = CaptureUnit(deviceID: config.micDeviceID)
             try plain.start()
             return plain
+        }
+    }
+
+    // MARK: Live mode — single interpreter line
+
+    /// 0 = idle, 1 = their speech → my language, 2 = my speech → theirs.
+    private var liveSource = 0
+
+    /// One voice at a time: the direction currently speaking holds the line
+    /// until its ring drains, then the other direction takes over.
+    private func renderLiveMix(_ out: UnsafeMutablePointer<Float>, frames: Int) {
+        let n = min(frames, scratchTranslated.count)
+        let aAvailable = translatedRing.availableToRead
+        let bAvailable = outboundRing.availableToRead
+
+        if liveSource == 1 && aAvailable == 0 && bAvailable > 0 {
+            liveSource = 2
+        } else if liveSource == 2 && bAvailable == 0 && aAvailable > 0 {
+            liveSource = 1
+        } else if liveSource == 0 {
+            liveSource = aAvailable > 0 ? 1 : (bAvailable > 0 ? 2 : 0)
+        }
+
+        switch liveSource {
+        case 1: translatedRing.read(into: out, count: n)
+        case 2: outboundRing.read(into: out, count: n)
+        default: out.update(repeating: 0, count: n)
+        }
+        if frames > n {
+            (out + n).update(repeating: 0, count: frames - n)
         }
     }
 
