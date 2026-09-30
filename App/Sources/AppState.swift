@@ -80,6 +80,99 @@ final class AppState: ObservableObject {
     // re-render the views that draw them (see Stores.swift).
     let levels = LevelStore()
     let captionStore = CaptionStore()
+    let insightStore = InsightStore()
+    private let insightEngine = InsightEngine()
+
+    @Published var insightEnabled = false {
+        didSet {
+            UserDefaults.standard.set(insightEnabled, forKey: "insightEnabled")
+            if !insightEnabled { insightEngine.stop() }
+            else if isRunning { startInsightEngine() }
+        }
+    }
+    @Published var insightContext = "" {
+        didSet { UserDefaults.standard.set(insightContext, forKey: "insightContext") }
+    }
+
+    func attachInsightDocument(url: URL) {
+        let name = url.lastPathComponent
+        insightStore.status = "Reading \(name)…"
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let text = InsightEngine.extractText(from: url)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard let text, !text.isEmpty else {
+                    self.insightStore.status = "Couldn't read \(name)"
+                    return
+                }
+                let doc = InsightStore.Doc(name: name, text: text, digest: nil, isMemorizing: true)
+                self.insightStore.docs.append(doc)
+                self.memorizeDocument(id: doc.id)
+            }
+        }
+    }
+
+    /// Distills an attached document into a memory brief (mini model, one
+    /// small call) so insights start from understanding, not raw text.
+    private func memorizeDocument(id: UUID) {
+        guard let index = insightStore.docs.firstIndex(where: { $0.id == id }) else { return }
+        let doc = insightStore.docs[index]
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            insightStore.docs[index].isMemorizing = false
+            insightStore.status = "Add the OpenAI key to memorize files (raw text will be used)"
+            return
+        }
+        insightEngine.apiKey = key
+        insightEngine.userLanguageName = Self.languageName(for: userLanguageCode)
+        insightStore.status = "Memorizing \(doc.name)…"
+        insightEngine.memorize(name: doc.name, text: doc.text) { [weak self] digest in
+            Task { @MainActor in
+                guard let self,
+                      let index = self.insightStore.docs.firstIndex(where: { $0.id == id }) else { return }
+                self.insightStore.docs[index].isMemorizing = false
+                if let digest, !digest.isEmpty {
+                    self.insightStore.docs[index].digest = digest
+                    self.insightStore.status = ""
+                } else {
+                    self.insightStore.status = "Couldn't memorize \(self.insightStore.docs[index].name) — raw text will be used"
+                }
+            }
+        }
+    }
+
+    func removeInsightDocument(id: UUID) {
+        insightStore.docs.removeAll { $0.id == id }
+    }
+
+    private func startInsightEngine() {
+        insightEngine.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        insightEngine.userLanguageName = Self.languageName(for: userLanguageCode)
+        insightEngine.onInsight = { [weak self] lines in
+            Task { @MainActor in
+                guard let self else { return }
+                self.insightStore.cards.insert(.init(date: Date(), lines: lines), at: 0)
+                if self.insightStore.cards.count > 12 {
+                    self.insightStore.cards.removeLast(self.insightStore.cards.count - 12)
+                }
+            }
+        }
+        insightEngine.onSummary = { [weak self] summary in
+            Task { @MainActor in self?.insightStore.summary = summary }
+        }
+        insightEngine.onStatus = { [weak self] message in
+            Task { @MainActor in
+                guard let self else { return }
+                self.insightStore.status = message
+                if !message.isEmpty {
+                    self.appendStatus("[insight] \(message)")
+                }
+            }
+        }
+        insightEngine.start(
+            context: insightContext,
+            docs: insightStore.docs.map { ($0.name, $0.text, $0.digest) })
+    }
     /// True when the session has been running a while but the meeting side
     /// is dead silent — almost always the meeting app's speaker not routed
     /// to "Interpreter Line Output".
@@ -133,8 +226,17 @@ final class AppState: ObservableObject {
     @Published var micMuted = false {
         didSet { pipeline.setMicMuted(micMuted) }
     }
-    @Published var inboundPaused = false {
-        didSet { pipeline.setInboundPaused(inboundPaused) }
+    @Published var translateMeeting: Bool {
+        didSet {
+            UserDefaults.standard.set(translateMeeting, forKey: "translateMeeting")
+            pipeline.setInboundPaused(!translateMeeting)
+        }
+    }
+    @Published var translateMine: Bool {
+        didSet {
+            UserDefaults.standard.set(translateMine, forKey: "translateMine")
+            pipeline.setOutboundEnabled(translateMine)
+        }
     }
     @Published var statusLines: [String] = []
     @Published var driverInstalled = false
@@ -201,6 +303,13 @@ final class AppState: ObservableObject {
         autoStopEnabled = defaults.object(forKey: "autoStopEnabled") == nil
             ? true : defaults.bool(forKey: "autoStopEnabled")
         liveMode = defaults.bool(forKey: "liveMode")
+        // Meeting translation defaults ON; translating your own voice is
+        // opt-in.
+        translateMeeting = defaults.object(forKey: "translateMeeting") == nil
+            ? true : defaults.bool(forKey: "translateMeeting")
+        translateMine = defaults.bool(forKey: "translateMine")
+        insightEnabled = defaults.bool(forKey: "insightEnabled")
+        insightContext = defaults.string(forKey: "insightContext") ?? ""
         meetingOriginalMix = defaults.object(forKey: "meetingOriginalMix") == nil
             ? 0.15 : defaults.double(forKey: "meetingOriginalMix")
         myVoiceMix = defaults.object(forKey: "myVoiceMix") == nil
@@ -213,13 +322,29 @@ final class AppState: ObservableObject {
         geminiApiKey = KeychainStore.load(account: KeychainStore.geminiAccount) ?? ""
 
         pipeline.onStatus = { [weak self] line in
-            Task { @MainActor in self?.appendStatus(line) }
+            Task { @MainActor in
+                guard let self else { return }
+                self.appendStatus(line)
+                if line.contains("transcription") {
+                    self.insightStore.status = line
+                }
+            }
         }
         pipeline.onCaption = { [weak self] delta, isFinal, speaker in
             Task { @MainActor in self?.appendCaption(delta: delta, isFinal: isFinal, speaker: speaker) }
         }
         pipeline.onError = { [weak self] message in
             Task { @MainActor in self?.lastError = message }
+        }
+        pipeline.onSTTTranscript = { [weak self] text, speaker in
+            Task { @MainActor in
+                guard let self else { return }
+                self.insightStore.transcript.append(.init(date: Date(), speaker: speaker, text: text))
+                if self.insightStore.transcript.count > 80 {
+                    self.insightStore.transcript.removeFirst(self.insightStore.transcript.count - 80)
+                }
+                self.feedInsight(speaker: speaker, text: text)
+            }
         }
         pipeline.onNotice = { [weak self] message in
             Task { @MainActor in
@@ -342,8 +467,9 @@ final class AppState: ObservableObject {
 
         saveAPIKey()
         micMuted = false
-        inboundPaused = false
         captionStore.captions.removeAll()
+        insightStore.transcript.removeAll()
+        insightStore.summary = ""
         liveCaptionIndex.removeAll()
 
         let config = InterpreterPipeline.Config(
@@ -366,7 +492,11 @@ final class AppState: ObservableObject {
             voiceGateEnabled: voiceGateEnabled,
             meetingOriginalGain: Float(meetingOriginalMix),
             myVoiceOriginalGain: Float(myVoiceMix),
-            liveMode: liveMode)
+            liveMode: liveMode,
+            translateMeeting: translateMeeting,
+            translateMine: translateMine,
+            insightTranscription: insightEnabled,
+            openAIKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
 
         // Pipeline startup does audio-unit setup and (optionally) waits for
         // TTS rendering — it must never run on the main thread or the UI
@@ -377,14 +507,16 @@ final class AppState: ObservableObject {
             do {
                 try pipeline.start(config: config)
                 await MainActor.run { [weak self] in
-                    self?.isStarting = false
-                    self?.isRunning = true
-                    self?.runningSince = Date()
-                    self?.meetingAudioSeen = false
-                    self?.noMeetingAudio = false
-                    self?.lastMeetingAudioAt = Date()
-                    self?.lastCheckInMinute = 0
-                    self?.startSessionTimer()
+                    guard let self else { return }
+                    self.isStarting = false
+                    self.isRunning = true
+                    self.runningSince = Date()
+                    self.meetingAudioSeen = false
+                    self.noMeetingAudio = false
+                    self.lastMeetingAudioAt = Date()
+                    self.lastCheckInMinute = 0
+                    self.startSessionTimer()
+                    if self.insightEnabled { self.startInsightEngine() }
                 }
             } catch {
                 pipeline.stop()
@@ -406,6 +538,7 @@ final class AppState: ObservableObject {
         sessionTimer?.invalidate()
         sessionTimer = nil
         voiceTestPhase = nil
+        insightEngine.stop()
     }
 
     // MARK: Session watchdog — 10-min check-ins, 15-min idle auto-stop
@@ -472,7 +605,7 @@ final class AppState: ObservableObject {
             if noMeetingAudio { noMeetingAudio = false }
             return
         }
-        guard !meetingAudioSeen, !inboundPaused, !liveMode,
+        guard !meetingAudioSeen, translateMeeting, !liveMode,
               let since = runningSince,
               Date().timeIntervalSince(since) > 8 else { return }
         if !noMeetingAudio { noMeetingAudio = true }
@@ -485,6 +618,11 @@ final class AppState: ObservableObject {
         if statusLines.count > 200 {
             statusLines.removeFirst(statusLines.count - 200)
         }
+    }
+
+    private func feedInsight(speaker: Caption.Speaker, text: String) {
+        guard insightEnabled else { return }
+        insightEngine.ingest(speaker: speaker == .you ? "You" : "Them", line: text)
     }
 
     private static func endsSentence(_ text: String) -> Bool {

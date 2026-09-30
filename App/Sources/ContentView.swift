@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var state: AppState
     @AppStorage("showSettings") private var showSettings = true
+    @AppStorage("selectedTab") private var selectedTab = "live"
     @State private var showSetupGuide = false
 
     var body: some View {
@@ -28,12 +29,16 @@ struct ContentView: View {
         ZStack(alignment: .top) {
             VStack(spacing: 0) {
                 topBar
-                Spacer(minLength: 0)
-                centerSection
-                Spacer(minLength: 0)
-                if state.captionsEnabled {
-                    CaptionsStrip(store: state.captionStore)
-                        .frame(height: 235)
+                if selectedTab == "insight" {
+                    CallInsightView(store: state.insightStore)
+                } else {
+                    Spacer(minLength: 0)
+                    centerSection
+                    Spacer(minLength: 0)
+                    if state.captionsEnabled {
+                        CaptionsStrip(store: state.captionStore)
+                            .frame(height: 235)
+                    }
                 }
             }
             if let error = state.lastError {
@@ -59,6 +64,14 @@ struct ContentView: View {
             Spacer()
                 .frame(width: 56) // traffic lights
             CherriLogo()
+            Spacer()
+            Picker("", selection: $selectedTab) {
+                Text("Live").tag("live")
+                Text("Call Insight").tag("insight")
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 220)
             Spacer()
             Button {
                 showSetupGuide = true
@@ -98,7 +111,7 @@ struct ContentView: View {
                     isRunning: state.isRunning,
                     isStarting: state.isStarting,
                     micMuted: state.micMuted,
-                    inboundPaused: state.inboundPaused
+                    inboundPaused: !state.translateMeeting
                 ) {
                     state.toggle()
                 }
@@ -117,35 +130,46 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if state.isRunning {
-                HStack(spacing: 12) {
+            HStack(spacing: 12) {
+                Button {
+                    state.translateMeeting.toggle()
+                } label: {
+                    Label("\(state.liveMode ? "Them" : "Meeting") → \(AppState.languageName(for: state.userLanguageCode))",
+                          systemImage: state.translateMeeting ? "checkmark.circle.fill" : "circle")
+                }
+                .buttonStyle(.glass)
+                .tint(state.translateMeeting ? .blue : nil)
+                .keyboardShortcut("p", modifiers: [.command])
+                .help("Translate the \(state.liveMode ? "other side" : "meeting") for you (⌘P). Off: you hear the original only, nothing streams inbound.")
+
+                Button {
+                    state.translateMine.toggle()
+                } label: {
+                    Label("Me → \(AppState.languageName(for: state.meetingLanguageCode))",
+                          systemImage: state.translateMine ? "checkmark.circle.fill" : "circle")
+                }
+                .buttonStyle(.glass)
+                .tint(state.translateMine ? .green : nil)
+                .keyboardShortcut("t", modifiers: [.command])
+                .help(state.liveMode
+                      ? "Master translation switch in Live mode (⌘T). Off: nothing is translated — the shared mic can't tell speakers apart."
+                      : "Translate your voice for them (⌘T). Off: they hear only your real voice, nothing streams outbound.")
+
+                if state.isRunning {
                     Button {
                         state.micMuted.toggle()
                     } label: {
-                        Label(state.micMuted ? "Unmute" : "Mute mic",
+                        Label(state.micMuted ? "Unmute" : "Mute",
                               systemImage: state.micMuted ? "mic.slash.fill" : "mic.fill")
-                            .frame(minWidth: 84)
                     }
                     .buttonStyle(.glass)
                     .tint(state.micMuted ? .red : nil)
                     .keyboardShortcut("m", modifiers: [.command])
-                    .help("Stops streaming your mic to the API (⌘M)")
-
-                    if !state.liveMode {
-                        Button {
-                            state.inboundPaused.toggle()
-                        } label: {
-                            Label(state.inboundPaused ? "Resume" : "Pause translation",
-                                  systemImage: state.inboundPaused ? "play.circle" : "pause.circle")
-                                .frame(minWidth: 84)
-                        }
-                        .buttonStyle(.glass)
-                        .tint(state.inboundPaused ? .orange : nil)
-                        .keyboardShortcut("p", modifiers: [.command])
-                        .help("Stops streaming meeting audio to the API (⌘P)")
-                    }
+                    .help("Mute your mic entirely (⌘M)")
                 }
-            } else if !state.driverInstalled && !state.liveMode {
+            }
+
+            if !state.isRunning && !state.driverInstalled && !state.liveMode {
                 Label("Audio driver not installed — run `make install-driver`", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -638,8 +662,8 @@ private struct SettingsSidebar: View {
                 if !state.liveMode {
                     Toggle("Conference mode", isOn: $state.voicePassthrough)
                     caption(state.voicePassthrough
-                            ? "The meeting hears your real voice continuously, dimmed while the interpreter speaks over it — like a conference interpreter feed."
-                            : "The meeting hears only the translated voice; your real voice is never sent.")
+                            ? "While translating: the meeting hears your real voice continuously, dimmed under the interpreter — like a conference feed."
+                            : "While translating: the meeting hears only the translated voice. (With translation off, your real voice always passes through.)")
                 }
             }
 

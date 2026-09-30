@@ -74,6 +74,18 @@ final class InterpreterPipeline {
         /// virtual devices. The mic feeds BOTH translation directions and
         /// both translated voices play on the speaker.
         var liveMode: Bool = false
+        /// Translate meeting audio for me. Off: I hear the original untouched
+        /// and nothing streams inbound (no cost).
+        var translateMeeting: Bool = true
+        /// Translate my voice for the meeting. Off: the meeting hears my real
+        /// voice only and nothing streams outbound.
+        var translateMine: Bool = true
+        /// Call Insight: run dedicated cheap transcription sessions so
+        /// insights work even with no direction translating.
+        var insightTranscription: Bool = false
+        /// OpenAI key for the transcription sessions (may differ from
+        /// `apiKey` when Gemini is the translation provider).
+        var openAIKey: String = ""
     }
 
     var onCaption: ((String, Bool, Caption.Speaker) -> Void)?
@@ -100,6 +112,13 @@ final class InterpreterPipeline {
     private var config: Config?
     private var sessionInbound: TranslationSession?
     private var sessionOutbound: TranslationSession?
+    // Insight transcription (original language, independent of translation).
+    private var sttMeeting: TranscriptionSession?
+    private var sttMic: TranscriptionSession?
+    private var sttMeetingTo24k: StreamResampler?
+    private var sttMicTo24k: StreamResampler?
+    /// Finished original-language utterances from the insight transcription.
+    var onSTTTranscript: ((String, Caption.Speaker) -> Void)?
 
     private var meetingCapture: CaptureUnit?   // from virtual Line Out
     private var micCapture: AudioCapturing?    // from real mic (AEC when possible)
@@ -257,7 +276,16 @@ final class InterpreterPipeline {
     /// through to the speakers at full volume.
     func setInboundPaused(_ paused: Bool) {
         inboundPaused = paused
-        onStatus?(paused ? "Translation paused — inbound streaming stopped" : "Translation resumed")
+        onStatus?(paused ? "Meeting translation off — original audio passes through" : "Meeting translation on")
+    }
+
+    // Outbound translation toggle: off = the meeting hears only the real
+    // voice (full volume), nothing streams outbound.
+    private var outboundEnabled = true
+
+    func setOutboundEnabled(_ enabled: Bool) {
+        outboundEnabled = enabled
+        onStatus?(enabled ? "My-voice translation on" : "My-voice translation off — real voice only")
     }
 
     // MARK: Lifecycle
@@ -401,6 +429,26 @@ final class InterpreterPipeline {
         inbound.connect()
         outbound.connect()
 
+        // --- Insight transcription (independent of the translate toggles) ------
+        if config.insightTranscription {
+            if config.openAIKey.isEmpty {
+                onStatus?("Insight transcription needs the OpenAI API key")
+            } else {
+                if !config.liveMode {
+                    let stt = TranscriptionSession(apiKey: config.openAIKey, label: "stt-meeting")
+                    stt.onUtterance = { [weak self] text in self?.onSTTTranscript?(text, .them) }
+                    stt.onStatus = { [weak self] in self?.onStatus?($0) }
+                    sttMeeting = stt
+                    stt.connect()
+                }
+                let sttM = TranscriptionSession(apiKey: config.openAIKey, label: "stt-mic")
+                sttM.onUtterance = { [weak self] text in self?.onSTTTranscript?(text, .you) }
+                sttM.onStatus = { [weak self] in self?.onStatus?($0) }
+                sttMic = sttM
+                sttM.connect()
+            }
+        }
+
         if config.liveMode {
             // --- Live conversation mode: mic + speaker only --------------------
             let speaker = PlaybackUnit(deviceID: config.outputDeviceID)
@@ -429,6 +477,7 @@ final class InterpreterPipeline {
             let mic = try startMicCapture(config: config)
             micCapture = mic
             micToAPI = StreamResampler(sourceRate: mic.sampleRate, targetRate: outbound.inputSampleRate)
+            sttMicTo24k = StreamResampler(sourceRate: mic.sampleRate, targetRate: 24000)
             micGate = VoiceGate(sampleRate: mic.sampleRate)
             meetingGate = nil
 
@@ -442,8 +491,18 @@ final class InterpreterPipeline {
                 self.apiSendQueue.async { [weak self] in
                     guard let self, !self.micMuted, let toAPI = self.micToAPI else { return }
                     let pcm = PCM.floatToPCM16(toAPI.process(chunk))
-                    self.sessionInbound?.sendAudio(pcm)
-                    self.sessionOutbound?.sendAudio(pcm)
+                    // "Me →" is the MASTER translation switch in live mode:
+                    // one shared mic can't attribute speakers, so with it off
+                    // nothing is translated (otherwise the inbound direction
+                    // would translate the user's own speech back at them).
+                    // Insight transcription continues regardless.
+                    if self.outboundEnabled {
+                        if !self.inboundPaused { self.sessionInbound?.sendAudio(pcm) }
+                        self.sessionOutbound?.sendAudio(pcm)
+                    }
+                    if let stt = self.sttMic, let to24k = self.sttMicTo24k {
+                        stt.sendAudio(PCM.floatToPCM16(to24k.process(chunk)))
+                    }
                 }
             }
         } else {
@@ -480,6 +539,7 @@ final class InterpreterPipeline {
         try meeting.start()
 
         meetingToAPI = StreamResampler(sourceRate: meeting.sampleRate, targetRate: inbound.inputSampleRate)
+        sttMeetingTo24k = StreamResampler(sourceRate: meeting.sampleRate, targetRate: 24000)
         meetingToSpeaker = StreamResampler(sourceRate: meeting.sampleRate, targetRate: speaker.sampleRate)
         api24kToSpeaker = StreamResampler(sourceRate: 24000, targetRate: speaker.sampleRate)
         api24kToVirtualMic = StreamResampler(sourceRate: 24000, targetRate: virtualMic.sampleRate)
@@ -494,11 +554,15 @@ final class InterpreterPipeline {
             // API path: gate on detected speech, then send off the audio thread.
             let gated = self.gatedChunk(self.meetingGate, samples, count)
             self.emitLevels()
-            guard !self.inboundPaused, let chunk = gated else { return }
+            guard let chunk = gated else { return }
             self.apiSendQueue.async { [weak self] in
-                guard let self, !self.inboundPaused, let to24k = self.meetingToAPI else { return }
-                let at24k = to24k.process(chunk)
-                self.sessionInbound?.sendAudio(PCM.floatToPCM16(at24k))
+                guard let self else { return }
+                if !self.inboundPaused, let toAPI = self.meetingToAPI {
+                    self.sessionInbound?.sendAudio(PCM.floatToPCM16(toAPI.process(chunk)))
+                }
+                if let stt = self.sttMeeting, let to24k = self.sttMeetingTo24k {
+                    stt.sendAudio(PCM.floatToPCM16(to24k.process(chunk)))
+                }
             }
         }
 
@@ -506,9 +570,11 @@ final class InterpreterPipeline {
         let mic = try startMicCapture(config: config)
         micCapture = mic
         micToAPI = StreamResampler(sourceRate: mic.sampleRate, targetRate: outbound.inputSampleRate)
-        micToVirtualMic = config.voicePassthrough
-            ? StreamResampler(sourceRate: mic.sampleRate, targetRate: virtualMic.sampleRate)
-            : nil
+        sttMicTo24k = StreamResampler(sourceRate: mic.sampleRate, targetRate: 24000)
+        // Always created: the real voice must reach the meeting whenever
+        // outbound translation is off, regardless of the conference-mode
+        // setting (which only governs behavior while translating).
+        micToVirtualMic = StreamResampler(sourceRate: mic.sampleRate, targetRate: virtualMic.sampleRate)
 
         micGate = VoiceGate(sampleRate: mic.sampleRate)
         meetingGate = VoiceGate(sampleRate: meeting.sampleRate)
@@ -533,7 +599,8 @@ final class InterpreterPipeline {
         }
 
         micMuted = false
-        inboundPaused = false
+        inboundPaused = !config.translateMeeting
+        outboundEnabled = config.translateMine
         isRunning = true
         onStatus?("Pipeline running")
     }
@@ -552,6 +619,12 @@ final class InterpreterPipeline {
         sessionOutbound?.close()
         sessionInbound = nil
         sessionOutbound = nil
+        sttMeeting?.close()
+        sttMic?.close()
+        sttMeeting = nil
+        sttMic = nil
+        sttMeetingTo24k = nil
+        sttMicTo24k = nil
 
         meetingToAPI = nil
         meetingToSpeaker = nil
@@ -665,10 +738,17 @@ final class InterpreterPipeline {
         scratchMicPass.withUnsafeMutableBufferPointer { voice in
             scratchOutbound.withUnsafeMutableBufferPointer { dub in
                 micPassthroughRing.read(into: voice.baseAddress!, count: n)
-                let dubAvailable = outboundRing.availableToRead
+                let dubAvailable = outboundEnabled ? outboundRing.availableToRead : 0
                 outboundRing.read(into: dub.baseAddress!, count: n)
+                if !outboundEnabled {
+                    dub.baseAddress!.update(repeating: 0, count: n)
+                }
 
-                guard config?.voicePassthrough == true else {
+                // Real voice passes through when conference mode is on OR when
+                // outbound translation is off (silence to the meeting would
+                // be a bug, not a setting).
+                let passthroughActive = (config?.voicePassthrough == true) || !outboundEnabled
+                guard passthroughActive else {
                     out.update(from: dub.baseAddress!, count: n)
                     return
                 }

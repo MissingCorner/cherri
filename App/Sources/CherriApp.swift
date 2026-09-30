@@ -44,9 +44,12 @@ private struct StatusBarMenu: View {
                 Button(state.micMuted ? "Unmute Mic" : "Mute Mic") {
                     state.micMuted.toggle()
                 }
-                Button(state.inboundPaused ? "Resume Translation" : "Pause Translation") {
-                    state.inboundPaused.toggle()
-                }
+            }
+            Button(state.translateMeeting ? "Stop Translating Meeting" : "Translate Meeting") {
+                state.translateMeeting.toggle()
+            }
+            Button(state.translateMine ? "Stop Translating My Voice" : "Translate My Voice") {
+                state.translateMine.toggle()
             }
 
             Divider()
@@ -69,7 +72,7 @@ private struct StatusBarMenu: View {
             let pair = "\(AppState.languageName(for: state.meetingLanguageCode)) ↔ \(AppState.languageName(for: state.userLanguageCode))"
             var line = "Interpreting · \(pair)"
             if state.micMuted { line += " · mic muted" }
-            if state.inboundPaused { line += " · paused" }
+            if !state.translateMeeting { line += " · meeting untranslated" }
             return line
         }
         return "Cherri — ready"
